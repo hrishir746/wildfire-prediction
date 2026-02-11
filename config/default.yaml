@@ -1,0 +1,26 @@
+# Wildfire Prediction System - Default Configuration
+
+simulation:
+  grid_size: [128, 128]        # rows, cols
+  cell_size_m: 30.0            # meters per cell
+  time_step_s: 60.0            # seconds per step
+  max_steps: 100
+
+  # Rothermel-inspired parameters
+  base_ros: 0.5                # base rate of spread (m/min)
+  wind_factor: 0.4             # wind influence on ROS
+  slope_factor: 0.3            # slope influence on ROS
+  fuel_moisture: 0.12          # 12% dead fuel moisture
+
+data:
+  dem_source: "usgs_3dep"
+  fuel_source: "landfire"
+  weather_source: "noaa"
+
+model:
+  architecture: "unet"
+  input_channels: 8
+  output_channels: 1
+  learning_rate: 1.0e-4
+  batch_size: 16
+  max_epochs: 20

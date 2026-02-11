@@ -1,0 +1,57 @@
+"""
+Run the full pipeline and generate all visuals.
+
+1. Simulation demo (Rothermel) → outputs/simulation_demo.png
+2. Train model (2 epochs for quick demo) → outputs/checkpoints/, outputs/training_curves.png
+3. Evaluate → outputs/evaluation_summary.txt, outputs/eval_samples.png
+4. Prediction comparison → outputs/prediction_comparison.png
+
+Then open the interpretive agent: streamlit run scripts/agent_app.py
+Run: python scripts/run_full_demo.py [--epochs 2]
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run full pipeline and generate visuals")
+    parser.add_argument("--epochs", type=int, default=2, help="Training epochs (2 = quick demo)")
+    parser.add_argument("--samples", type=int, default=200, help="Training samples")
+    parser.add_argument("--skip-train", action="store_true", help="Skip training (use existing checkpoint)")
+    args = parser.parse_args()
+
+    steps = [
+        ("Simulation demo", [sys.executable, str(ROOT / "scripts" / "run_simulation_demo.py"), "--no-show"]),
+        ("Training", [sys.executable, str(ROOT / "scripts" / "train_model.py"), "--epochs", str(args.epochs), "--samples", str(args.samples)]),
+        ("Evaluation", [sys.executable, str(ROOT / "scripts" / "evaluate_model.py")]),
+        ("Prediction visuals", [sys.executable, str(ROOT / "scripts" / "visualize_predictions.py")]),
+    ]
+    if args.skip_train:
+        steps = [s for s in steps if s[0] != "Training"]
+
+    for name, cmd in steps:
+        print(f"\n{'='*50}\n{name}\n{'='*50}")
+        result = subprocess.run(cmd, cwd=str(ROOT))
+        if result.returncode != 0:
+            print(f"Step '{name}' failed with code {result.returncode}")
+            return result.returncode
+
+    out_dir = ROOT / "outputs"
+    print("\n" + "=" * 50)
+    print("Done. Outputs:")
+    print("=" * 50)
+    for f in sorted(out_dir.rglob("*")):
+        if f.is_file():
+            print(f"  {f.relative_to(ROOT)}")
+    print("\nTo open the interpretive agent with all visuals:")
+    print("  streamlit run scripts/agent_app.py")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,43 @@
+# Data (large files)
+data/
+*.tif
+*.tiff
+*.nc
+*.geojson
+*.shp
+*.dbf
+*.shx
+*.zip
+*.deb
+*.xlsx
+
+# Outputs
+outputs/
+checkpoints/
+*.png
+!docs/*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+.venv-*/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/

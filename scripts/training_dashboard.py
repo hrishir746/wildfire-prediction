@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+LIVE TRAINING DASHBOARD FOR WILDFIRE PREDICTION
+Real-time monitoring of training metrics, predictions, and system stats.
+
+Usage:
+    streamlit run scripts/training_dashboard.py
+"""
+import sys
+import os
+from pathlib import Path
+
+# Set UTF-8 encoding for Windows compatibility
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import streamlit as st
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+import time
+from datetime import datetime
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
+
+from src.model import build_unet
+
+
+# Page configuration
+st.set_page_config(
+    page_title="Wildfire Training Dashboard",
+    page_icon="[FIRE]",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS for better styling
+st.markdown("""
+    <style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .stMetric {
+        background-color: #ffffff;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+class TrainingMonitor:
+    """Monitor training progress from log files and checkpoints."""
+    
+    def __init__(self, log_dir: Path = ROOT / "outputs"):
+        self.log_dir = log_dir
+        self.metrics_file = log_dir / "training_metrics.json"
+        self.checkpoint_dir = log_dir / "checkpoints"
+        
+    def get_latest_metrics(self) -> Optional[Dict]:
+        """Load latest training metrics from JSON log."""
+        if not self.metrics_file.exists():
+            return None
+        try:
+            with open(self.metrics_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data
+        except Exception as e:
+            st.error(f"Error loading metrics: {e}")
+            return None
+    
+    def get_checkpoints(self) -> List[Dict]:
+        """List available checkpoints with metadata."""
+        if not self.checkpoint_dir.exists():
+            return []
+        
+        checkpoints = []
+        for ckpt_path in sorted(self.checkpoint_dir.glob("*.pt")):
+            try:
+                stat = ckpt_path.stat()
+                size_mb = stat.st_size / (1024 * 1024)
+                modified = datetime.fromtimestamp(stat.st_mtime)
+                
+                # Try to load checkpoint info
+                try:
+                    ckpt = torch.load(ckpt_path, map_location='cpu')
+                    epoch = ckpt.get('epoch', 'N/A')
+                    loss = ckpt.get('loss', 'N/A')
+                except:
+                    epoch = 'N/A'
+                    loss = 'N/A'
+                
+                checkpoints.append({
+                    'name': ckpt_path.name,
+                    'path': str(ckpt_path),
+                    'size_mb': size_mb,
+                    'modified': modified,
+                    'epoch': epoch,
+                    'loss': loss
+                })
+            except Exception as e:
+                continue
+        
+        return checkpoints
+    
+    def load_checkpoint_for_viz(self, ckpt_path: str) -> Optional[torch.nn.Module]:
+        """Load model from checkpoint for visualization."""
+        try:
+            checkpoint = torch.load(ckpt_path, map_location='cpu')
+            model = build_unet(in_channels=8, out_channels=1)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model.eval()
+            return model
+        except Exception as e:
+            st.error(f"Error loading checkpoint: {e}")
+            return None
+
+
+def plot_training_curves(metrics: Dict):
+    """Plot training loss and IoU curves."""
+    if not metrics or 'history' not in metrics:
+        st.warning("No training history available")
+        return
+    
+    history = metrics['history']
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Training Loss
+    if 'train_loss' in history and len(history['train_loss']) > 0:
+        axes[0, 0].plot(history['train_loss'], 'b-', linewidth=2, label='Train Loss')
+        if 'val_loss' in history and len(history['val_loss']) > 0:
+            axes[0, 0].plot(history['val_loss'], 'r--', linewidth=2, label='Val Loss')
+        axes[0, 0].set_xlabel('Epoch', fontsize=12)
+        axes[0, 0].set_ylabel('Loss', fontsize=12)
+        axes[0, 0].set_title('Training & Validation Loss', fontsize=14, fontweight='bold')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+    
+    # IoU
+    if 'val_iou' in history and len(history['val_iou']) > 0:
+        axes[0, 1].plot(history['val_iou'], 'g-', linewidth=2)
+        axes[0, 1].axhline(y=0.8, color='r', linestyle='--', label='Target (80%)')
+        axes[0, 1].set_xlabel('Epoch', fontsize=12)
+        axes[0, 1].set_ylabel('IoU', fontsize=12)
+        axes[0, 1].set_title('Validation IoU', fontsize=14, fontweight='bold')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        axes[0, 1].set_ylim([0, 1])
+    
+    # Dice Coefficient
+    if 'val_dice' in history and len(history['val_dice']) > 0:
+        axes[1, 0].plot(history['val_dice'], 'purple', linewidth=2)
+        axes[1, 0].axhline(y=0.8, color='r', linestyle='--', label='Target (80%)')
+        axes[1, 0].set_xlabel('Epoch', fontsize=12)
+        axes[1, 0].set_ylabel('Dice', fontsize=12)
+        axes[1, 0].set_title('Validation Dice Coefficient', fontsize=14, fontweight='bold')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        axes[1, 0].set_ylim([0, 1])
+    
+    # Learning Rate
+    if 'learning_rate' in history and len(history['learning_rate']) > 0:
+        axes[1, 1].plot(history['learning_rate'], 'orange', linewidth=2)
+        axes[1, 1].set_xlabel('Epoch', fontsize=12)
+        axes[1, 1].set_ylabel('Learning Rate', fontsize=12)
+        axes[1, 1].set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].set_yscale('log')
+    
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close()
+
+
+def visualize_prediction(model: torch.nn.Module, sample_idx: int = 0):
+    """Visualize a sample prediction from the model."""
+    try:
+        # Load a sample from validation data
+        val_dir = ROOT / "outputs" / "validation_samples"
+        if not val_dir.exists():
+            st.warning("No validation samples available for visualization")
+            return
+        
+        # Try to find sample files
+        input_file = val_dir / f"sample_{sample_idx}_input.npy"
+        target_file = val_dir / f"sample_{sample_idx}_target.npy"
+        
+        if not (input_file.exists() and target_file.exists()):
+            st.warning(f"Sample {sample_idx} not found")
+            return
+        
+        # Load sample
+        input_data = np.load(input_file)  # (8, H, W)
+        target_data = np.load(target_file)  # (1, H, W) or (H, W)
+        
+        # Run prediction
+        with torch.no_grad():
+            input_tensor = torch.from_numpy(input_data).unsqueeze(0).float()  # (1, 8, H, W)
+            output = model(input_tensor)
+            prediction = torch.sigmoid(output).squeeze().cpu().numpy()  # (H, W)
+        
+        if target_data.ndim == 3:
+            target_data = target_data.squeeze()
+        
+        # Visualize
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        
+        # Input channels
+        channel_names = ['Slope', 'Aspect Sin', 'Aspect Cos', 'Fuel', 
+                         'Wind Speed', 'Wind Sin', 'Wind Cos', 'Initial Fire']
+        for i in range(8):
+            ax = axes[i // 4, i % 4]
+            im = ax.imshow(input_data[i], cmap='viridis')
+            ax.set_title(channel_names[i], fontsize=10)
+            ax.axis('off')
+            plt.colorbar(im, ax=ax, fraction=0.046)
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        
+        # Prediction vs Ground Truth
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        axes[0].imshow(target_data, cmap='hot', vmin=0, vmax=1)
+        axes[0].set_title('Ground Truth', fontsize=14, fontweight='bold')
+        axes[0].axis('off')
+        
+        axes[1].imshow(prediction, cmap='hot', vmin=0, vmax=1)
+        axes[1].set_title('Model Prediction', fontsize=14, fontweight='bold')
+        axes[1].axis('off')
+        
+        diff = np.abs(prediction - target_data)
+        axes[2].imshow(diff, cmap='RdYlGn_r', vmin=0, vmax=1)
+        axes[2].set_title('Absolute Error', fontsize=14, fontweight='bold')
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+        
+        # Calculate metrics
+        pred_binary = (prediction > 0.5).astype(float)
+        tp = np.sum(pred_binary * target_data)
+        fp = np.sum(pred_binary * (1 - target_data))
+        fn = np.sum((1 - pred_binary) * target_data)
+        
+        iou = tp / (tp + fp + fn + 1e-6)
+        dice = 2 * tp / (2 * tp + fp + fn + 1e-6)
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Sample IoU", f"{iou:.4f}")
+        col2.metric("Sample Dice", f"{dice:.4f}")
+        col3.metric("Mean Absolute Error", f"{diff.mean():.4f}")
+        
+    except Exception as e:
+        st.error(f"Error visualizing prediction: {e}")
+
+
+def main():
+    """Main dashboard application."""
+    
+    # Title and header
+    st.title("[FIRE] Wildfire Prediction Training Dashboard")
+    st.markdown("**Real-time monitoring of U-Net training for wildfire spread prediction**")
+    st.markdown("---")
+    
+    # Initialize monitor
+    monitor = TrainingMonitor()
+    
+    # Sidebar
+    st.sidebar.header("⚙️ Dashboard Settings")
+    
+    # Auto-refresh toggle
+    auto_refresh = st.sidebar.checkbox("Auto-refresh (5s)", value=False)
+    if auto_refresh:
+        time.sleep(5)
+        st.rerun()
+    
+    # Manual refresh button
+    if st.sidebar.button("🔄 Refresh Now"):
+        st.rerun()
+    
+    st.sidebar.markdown("---")
+    
+    # Display mode
+    display_mode = st.sidebar.radio(
+        "Display Mode",
+        ["Overview", "Training Curves", "Predictions", "Checkpoints"]
+    )
+    
+    # Main content area
+    if display_mode == "Overview":
+        st.header("[CHART] Training Overview")
+        
+        # Load latest metrics
+        metrics = monitor.get_latest_metrics()
+        
+        if metrics is None:
+            st.warning("[WARNING] No training metrics found. Start training to see live updates!")
+            st.info("Training metrics will be saved to: `outputs/training_metrics.json`")
+            
+            # Show example training command
+            with st.expander("How to start training"):
+                st.code("""
+# Option 1: GPU-optimized training (recommended)
+python scripts/train_gpu_optimized.py
+
+# Option 2: Standard training
+python scripts/train_model.py --epochs 50 --samples 1000
+
+# Option 3: Extended GPU training
+python scripts/train_extended_gpu.py
+                """, language="bash")
+        else:
+            # Current training status
+            status = metrics.get('status', 'Unknown')
+            current_epoch = metrics.get('current_epoch', 0)
+            total_epochs = metrics.get('total_epochs', 0)
+            
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Training Status", status)
+            with col2:
+                st.metric("Current Epoch", f"{current_epoch}/{total_epochs}")
+            with col3:
+                if 'eta_minutes' in metrics:
+                    st.metric("ETA", f"{metrics['eta_minutes']:.1f} min")
+            
+            st.markdown("---")
+            
+            # Latest metrics
+            st.subheader("📈 Latest Metrics")
+            
+            history = metrics.get('history', {})
+            if history:
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    if 'train_loss' in history and len(history['train_loss']) > 0:
+                        latest_loss = history['train_loss'][-1]
+                        st.metric("Train Loss", f"{latest_loss:.4f}")
+                
+                with col2:
+                    if 'val_loss' in history and len(history['val_loss']) > 0:
+                        latest_val_loss = history['val_loss'][-1]
+                        st.metric("Val Loss", f"{latest_val_loss:.4f}")
+                
+                with col3:
+                    if 'val_iou' in history and len(history['val_iou']) > 0:
+                        latest_iou = history['val_iou'][-1]
+                        delta = "[TARGET] Target!" if latest_iou >= 0.8 else None
+                        st.metric("Val IoU", f"{latest_iou:.4f}", delta=delta)
+                
+                with col4:
+                    if 'val_dice' in history and len(history['val_dice']) > 0:
+                        latest_dice = history['val_dice'][-1]
+                        delta = "[TARGET] Target!" if latest_dice >= 0.8 else None
+                        st.metric("Val Dice", f"{latest_dice:.4f}", delta=delta)
+            
+            # Mini training curves
+            st.markdown("---")
+            st.subheader("📉 Training Progress")
+            plot_training_curves(metrics)
+            
+            # System info
+            if 'system_info' in metrics:
+                st.markdown("---")
+                st.subheader("💻 System Information")
+                sys_info = metrics['system_info']
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Device", sys_info.get('device', 'N/A'))
+                with col2:
+                    st.metric("GPU Available", "Yes [OK]" if sys_info.get('cuda_available') else "No")
+                with col3:
+                    if 'gpu_name' in sys_info:
+                        st.metric("GPU", sys_info['gpu_name'])
+                
+                # GPU Memory Monitoring
+                if sys_info.get('cuda_available'):
+                    st.markdown("---")
+                    st.subheader("🎮 GPU Memory Usage")
+                    
+                    # Get current GPU memory stats
+                    try:
+                        gpu_mem_allocated = torch.cuda.memory_allocated() / 1e9
+                        gpu_mem_reserved = torch.cuda.memory_reserved() / 1e9
+                        gpu_mem_max = torch.cuda.max_memory_allocated() / 1e9
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Allocated", f"{gpu_mem_allocated:.2f} GB")
+                        with col2:
+                            st.metric("Reserved", f"{gpu_mem_reserved:.2f} GB")
+                        with col3:
+                            st.metric("Peak", f"{gpu_mem_max:.2f} GB")
+                        
+                        # Display GPU memory from metrics if available
+                        if 'gpu_memory_allocated' in sys_info:
+                            st.info(f"Training GPU Memory: {sys_info['gpu_memory_allocated']:.2f} GB allocated, {sys_info.get('gpu_memory_reserved', 0):.2f} GB reserved")
+                    except Exception as e:
+                        st.warning(f"Could not retrieve GPU memory stats: {e}")
+    
+    elif display_mode == "Training Curves":
+        st.header("📈 Training Curves")
+        
+        metrics = monitor.get_latest_metrics()
+        if metrics:
+            plot_training_curves(metrics)
+            
+            # Export data option
+            if st.button("📥 Export Training Data"):
+                history = metrics.get('history', {})
+                df = pd.DataFrame(history)
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name=f"training_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+        else:
+            st.warning("No training data available")
+    
+    elif display_mode == "Predictions":
+        st.header("🔮 Model Predictions")
+        
+        # Checkpoint selector
+        checkpoints = monitor.get_checkpoints()
+        if not checkpoints:
+            st.warning("No checkpoints available")
+        else:
+            ckpt_names = [c['name'] for c in checkpoints]
+            selected_ckpt = st.selectbox("Select Checkpoint", ckpt_names)
+            
+            selected_ckpt_info = next(c for c in checkpoints if c['name'] == selected_ckpt)
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Epoch", selected_ckpt_info['epoch'])
+            col2.metric("Loss", f"{selected_ckpt_info['loss']:.4f}" if isinstance(selected_ckpt_info['loss'], (int, float)) else "N/A")
+            col3.metric("Size", f"{selected_ckpt_info['size_mb']:.1f} MB")
+            
+            # Sample selector
+            sample_idx = st.slider("Sample Index", 0, 10, 0)
+            
+            # Load and visualize
+            if st.button("🎨 Visualize Prediction"):
+                with st.spinner("Loading model and generating prediction..."):
+                    model = monitor.load_checkpoint_for_viz(selected_ckpt_info['path'])
+                    if model:
+                        visualize_prediction(model, sample_idx)
+    
+    elif display_mode == "Checkpoints":
+        st.header("💾 Model Checkpoints")
+        
+        checkpoints = monitor.get_checkpoints()
+        if not checkpoints:
+            st.warning("No checkpoints found")
+        else:
+            # Create table
+            df = pd.DataFrame(checkpoints)
+            df['modified'] = df['modified'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            df['size_mb'] = df['size_mb'].round(2)
+            
+            st.dataframe(
+                df[['name', 'epoch', 'loss', 'size_mb', 'modified']],
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # Checkpoint management
+            st.markdown("---")
+            st.subheader("Checkpoint Actions")
+            
+            selected = st.selectbox("Select checkpoint for actions", [c['name'] for c in checkpoints])
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("[CHART] View Details"):
+                    ckpt_info = next(c for c in checkpoints if c['name'] == selected)
+                    st.json(ckpt_info)
+            
+            with col2:
+                if st.button("🗑️ Delete Checkpoint"):
+                    st.warning("Deletion not implemented in read-only mode")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        f"**Last updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
+        f"**Workspace:** `{ROOT}`"
+    )
+
+
+if __name__ == "__main__":
+    main()

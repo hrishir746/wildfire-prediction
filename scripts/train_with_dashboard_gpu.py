@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GPU-ACCELERATED TRAINING SCRIPT WITH LIVE DASHBOARD
+Train U-Net with GPU-accelerated data generation for faster preprocessing.
+
+Usage:
+    # Terminal 1: Start training with GPU data generation
+    python scripts/train_with_dashboard_gpu.py --epochs 50 --samples 1000 --grid-size 512
+    
+    # Terminal 2: Launch dashboard
+    streamlit run scripts/training_dashboard.py
+"""
+import sys
+import os
+from pathlib import Path
+
+# Set UTF-8 encoding for Windows
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import argparse
+import json
+import time
+from datetime import datetime
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from src.data import WildfireSyntheticDatasetGPU
+from src.model import build_unet
+from src.evaluation import iou_batch_torch
+
+
+class DashboardLogger:
+    """Logger for real-time dashboard updates."""
+    
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_file = output_dir / "training_metrics.json"
+        self.sample_dir = output_dir / "validation_samples"
+        self.sample_dir.mkdir(exist_ok=True)
+        
+        self.metrics = {
+            'status': 'initializing',
+            'current_epoch': 0,
+            'total_epochs': 0,
+            'start_time': datetime.now().isoformat(),
+            'history': {
+                'train_loss': [],
+                'val_loss': [],
+                'val_iou': [],
+                'val_dice': [],
+                'learning_rate': [],
+            },
+            'system_info': {
+                'device': str(torch.device('cuda' if torch.cuda.is_available() else 'cpu')),
+                'cuda_available': torch.cuda.is_available(),
+            }
+        }
+        
+        # Add GPU info if available
+        if torch.cuda.is_available():
+            self.metrics['system_info']['gpu_name'] = torch.cuda.get_device_name(0)
+            self.metrics['system_info']['gpu_memory_gb'] = torch.cuda.get_device_properties(0).total_memory / 1e9
+        
+        self._save()
+    
+    def update(self, epoch: int, train_loss: float, val_loss: float = None, 
+               val_iou: float = None, val_dice: float = None, lr: float = None):
+        """Update metrics for current epoch."""
+        self.metrics['current_epoch'] = epoch
+        self.metrics['history']['train_loss'].append(float(train_loss))
+        
+        if val_loss is not None:
+            self.metrics['history']['val_loss'].append(float(val_loss))
+        if val_iou is not None:
+            self.metrics['history']['val_iou'].append(float(val_iou))
+        if val_dice is not None:
+            self.metrics['history']['val_dice'].append(float(val_dice))
+        if lr is not None:
+            self.metrics['history']['learning_rate'].append(float(lr))
+        
+        # GPU memory tracking
+        if torch.cuda.is_available():
+            self.metrics['system_info']['gpu_memory_allocated'] = torch.cuda.memory_allocated() / 1e9
+            self.metrics['system_info']['gpu_memory_reserved'] = torch.cuda.memory_reserved() / 1e9
+            self.metrics['system_info']['gpu_memory_peak'] = torch.cuda.max_memory_allocated() / 1e9
+        
+        # Calculate ETA
+        elapsed = (datetime.now() - datetime.fromisoformat(self.metrics['start_time'])).total_seconds()
+        epochs_done = epoch
+        epochs_left = self.metrics['total_epochs'] - epoch
+        if epochs_done > 0:
+            eta_seconds = (elapsed / epochs_done) * epochs_left
+            self.metrics['eta_minutes'] = eta_seconds / 60
+        
+        self._save()
+    
+    def set_status(self, status: str):
+        """Update training status."""
+        self.metrics['status'] = status
+        self._save()
+    
+    def set_total_epochs(self, total: int):
+        """Set total number of epochs."""
+        self.metrics['total_epochs'] = total
+        self._save()
+    
+    def save_validation_sample(self, idx: int, input_data: np.ndarray, target: np.ndarray):
+        """Save a validation sample for visualization."""
+        np.save(self.sample_dir / f"sample_{idx}_input.npy", input_data)
+        np.save(self.sample_dir / f"sample_{idx}_target.npy", target)
+    
+    def _save(self):
+        """Save metrics to JSON file."""
+        try:
+            with open(self.metrics_file, 'w', encoding='utf-8') as f:
+                json.dump(self.metrics, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Warning: Could not save metrics: {e}")
+
+
+def dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+    """Dice coefficient loss."""
+    pred = torch.sigmoid(pred)
+    intersection = (pred * target).sum()
+    return 1 - (2 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+
+
+def combined_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Combined Dice + BCE loss."""
+    bce = nn.BCEWithLogitsLoss()(logits, target)
+    dice = dice_loss(logits, target)
+    return 0.5 * bce + 0.5 * dice
+
+
+def calculate_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
+    """Calculate IoU and Dice metrics."""
+    pred_binary = (pred > 0.5).float()
+    
+    tp = (pred_binary * target).sum()
+    fp = (pred_binary * (1 - target)).sum()
+    fn = ((1 - pred_binary) * target).sum()
+    
+    iou = tp / (tp + fp + fn + 1e-6)
+    dice = 2 * tp / (2 * tp + fp + fn + 1e-6)
+    
+    return {
+        'iou': iou.item(),
+        'dice': dice.item()
+    }
+
+
+def train_epoch(model, train_loader, optimizer, criterion, device):
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    
+    pbar = tqdm(train_loader, desc="Training", leave=False)
+    for x, y in pbar:
+        x, y = x.to(device), y.to(device)
+        
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        total_loss += loss.item()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    
+    return total_loss / len(train_loader)
+
+
+def validate_epoch(model, val_loader, criterion, device):
+    """Validate for one epoch."""
+    model.eval()
+    total_loss = 0.0
+    total_iou = 0.0
+    total_dice = 0.0
+    
+    with torch.no_grad():
+        for x, y in tqdm(val_loader, desc="Validating", leave=False):
+            x, y = x.to(device), y.to(device)
+            
+            logits = model(x)
+            loss = criterion(logits, y)
+            pred = torch.sigmoid(logits)
+            
+            metrics = calculate_metrics(pred, y)
+            
+            total_loss += loss.item()
+            total_iou += metrics['iou']
+            total_dice += metrics['dice']
+    
+    n_batches = len(val_loader)
+    return {
+        'loss': total_loss / n_batches,
+        'iou': total_iou / n_batches,
+        'dice': total_dice / n_batches
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train with GPU-accelerated data generation")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--samples", type=int, default=1000, help="Number of training samples")
+    parser.add_argument("--grid-size", type=int, default=512, help="Grid size (512x512 default)")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument("--val-split", type=float, default=0.2, help="Validation split ratio")
+    parser.add_argument("--save-samples", type=int, default=5, help="Number of validation samples to save")
+    parser.add_argument("--gen-batch-size", type=int, default=10, help="Batch size for GPU data generation")
+    args = parser.parse_args()
+    
+    # Device setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print("=" * 80)
+    print("WILDFIRE TRAINING WITH GPU-ACCELERATED DATA GENERATION")
+    print("=" * 80)
+    print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print(f"Grid Size: {args.grid_size}x{args.grid_size}")
+    print(f"Samples: {args.samples} (train/val split: {1-args.val_split:.0%}/{args.val_split:.0%})")
+    print(f"Epochs: {args.epochs}, Batch Size: {args.batch_size}, LR: {args.lr}")
+    print(f"GPU Data Generation Batch Size: {args.gen_batch_size}")
+    print("=" * 80)
+    
+    # Initialize dashboard logger
+    logger = DashboardLogger(ROOT / "outputs")
+    logger.set_total_epochs(args.epochs)
+    logger.set_status('preparing_data')
+    
+    # Create dataset with GPU acceleration
+    print("\n[1/4] Creating dataset with GPU acceleration...")
+    grid_size = (args.grid_size, args.grid_size)
+    full_dataset = WildfireSyntheticDatasetGPU(
+        num_samples=args.samples,
+        grid_size=grid_size,
+        horizon_steps=10,
+        seed=42,
+        augment_spatial=True,
+        augment_photometric=True,
+        device=device,
+        batch_generate=args.gen_batch_size,
+    )
+    
+    # Train/val split
+    n_val = int(args.samples * args.val_split)
+    n_train = args.samples - n_val
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=0, pin_memory=(device.type == 'cuda')
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=0, pin_memory=(device.type == 'cuda')
+    )
+    
+    print(f"  Train samples: {n_train}, Val samples: {n_val}")
+    
+    # Save validation samples for dashboard visualization
+    print(f"\n[2/4] Saving {args.save_samples} validation samples for visualization...")
+    for i in range(min(args.save_samples, n_val)):
+        sample_idx = i
+        x, y = val_dataset[sample_idx]
+        logger.save_validation_sample(i, x.numpy(), y.numpy())
+    print(f"  Saved to: {logger.sample_dir}")
+    
+    # Initialize model
+    print("\n[3/4] Initializing model...")
+    model = build_unet(in_channels=8, out_channels=1, dropout_rate=0.2).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    criterion = combined_loss
+    
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parameters: {n_params:,}")
+    
+    # Training loop
+    print("\n[4/4] Training model...")
+    print(f"  [IDEA] Launch dashboard in another terminal: streamlit run scripts/training_dashboard.py")
+    print("=" * 80)
+    
+    logger.set_status('training')
+    best_val_loss = float('inf')
+    best_epoch = 0
+    
+    ckpt_dir = ROOT / "outputs" / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        
+        # Train
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        
+        # Validate
+        val_metrics = validate_epoch(model, val_loader, criterion, device)
+        
+        # Get current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Update dashboard
+        logger.update(
+            epoch=epoch,
+            train_loss=train_loss,
+            val_loss=val_metrics['loss'],
+            val_iou=val_metrics['iou'],
+            val_dice=val_metrics['dice'],
+            lr=current_lr
+        )
+        
+        # Step scheduler
+        scheduler.step()
+        
+        # Print progress
+        epoch_time = time.time() - epoch_start
+        print(f"Epoch {epoch:3d}/{args.epochs} | "
+              f"Train Loss: {train_loss:.4f} | "
+              f"Val Loss: {val_metrics['loss']:.4f} | "
+              f"IoU: {val_metrics['iou']:.4f} | "
+              f"Dice: {val_metrics['dice']:.4f} | "
+              f"LR: {current_lr:.2e} | "
+              f"Time: {epoch_time:.1f}s")
+        
+        # Save checkpoint if best
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            best_epoch = epoch
+            
+            ckpt_path = ckpt_dir / "unet_best.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': val_metrics['loss'],
+                'iou': val_metrics['iou'],
+                'dice': val_metrics['dice'],
+            }, ckpt_path)
+            print(f"  [OK] New best model saved (epoch {epoch})")
+        
+        # Save periodic checkpoints
+        if epoch % 10 == 0:
+            ckpt_path = ckpt_dir / f"unet_epoch_{epoch}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': val_metrics['loss'],
+                'iou': val_metrics['iou'],
+                'dice': val_metrics['dice'],
+            }, ckpt_path)
+    
+    # Save final checkpoint
+    final_path = ckpt_dir / "unet_final.pt"
+    torch.save({
+        'epoch': args.epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': val_metrics['loss'],
+        'iou': val_metrics['iou'],
+        'dice': val_metrics['dice'],
+    }, final_path)
+    
+    logger.set_status('completed')
+    
+    print("\n" + "=" * 80)
+    print("TRAINING COMPLETED!")
+    print("=" * 80)
+    print(f"Best validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
+    print(f"Final IoU: {val_metrics['iou']:.4f}")
+    print(f"Final Dice: {val_metrics['dice']:.4f}")
+    print(f"\nCheckpoints saved to: {ckpt_dir}")
+    print(f"Metrics logged to: {logger.metrics_file}")
+    print("\n[IDEA] View results in dashboard: streamlit run scripts/training_dashboard.py")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()

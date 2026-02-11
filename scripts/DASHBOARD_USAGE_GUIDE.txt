@@ -1,0 +1,275 @@
+================================================================================
+    🔥 WILDFIRE PREDICTION - LIVE TRAINING DASHBOARD USAGE GUIDE 🔥
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         QUICK START (2 TERMINALS)                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+TERMINAL 1 - TRAINING:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ python scripts/train_with_dashboard.py --epochs 50 --samples 1000          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+TERMINAL 2 - DASHBOARD:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ streamlit run scripts/training_dashboard.py                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+BROWSER:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ http://localhost:8501                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                            TRAINING OPTIONS
+================================================================================
+
+QUICK TEST (5 minutes):
+    python scripts/train_with_dashboard.py --epochs 10 --samples 100 --grid-size 128
+
+PRODUCTION (30-60 minutes on GPU):
+    python scripts/train_with_dashboard.py --epochs 50 --samples 1000 --grid-size 512
+
+HIGH ACCURACY (2-4 hours on GPU):
+    python scripts/train_with_dashboard.py --epochs 100 --samples 2000 --grid-size 512
+
+CUSTOM OPTIONS:
+    --epochs 50           Number of training epochs
+    --samples 1000        Number of synthetic samples to generate
+    --grid-size 512       Grid resolution (512x512 recommended)
+    --batch-size 4        Batch size (reduce if GPU memory limited)
+    --lr 5e-4             Learning rate
+    --val-split 0.2       Validation split ratio (20%)
+    --save-samples 5      Number of validation samples to save for viz
+
+================================================================================
+                        DASHBOARD VIEWS & FEATURES
+================================================================================
+
+1. 📊 OVERVIEW TAB
+   ├─ Training Status (Initializing → Training → Completed)
+   ├─ Current Epoch / Total Epochs
+   ├─ ETA (Estimated Time Remaining)
+   ├─ Latest Metrics: Train Loss, Val Loss, IoU, Dice
+   ├─ Mini Training Curves
+   └─ System Info (Device, GPU)
+
+2. 📈 TRAINING CURVES TAB
+   ├─ Train/Val Loss Plot
+   ├─ IoU Plot (with 80% target line)
+   ├─ Dice Plot (with 80% target line)
+   ├─ Learning Rate Schedule
+   └─ Export to CSV
+
+3. 🔮 PREDICTIONS TAB
+   ├─ Select Checkpoint
+   ├─ Browse Validation Samples (0-N)
+   ├─ View 8 Input Channels:
+   │  ├─ Slope, Aspect Sin, Aspect Cos
+   │  ├─ Fuel, Wind Speed, Wind Sin, Wind Cos
+   │  └─ Initial Fire
+   ├─ Compare: Ground Truth vs Prediction vs Error
+   └─ Sample Metrics: IoU, Dice, MAE
+
+4. 💾 CHECKPOINTS TAB
+   ├─ Browse All Checkpoints
+   ├─ View Metadata (Epoch, Loss, Size, Date)
+   └─ Inspect Checkpoint Details
+
+================================================================================
+                          KEY METRICS TO WATCH
+================================================================================
+
+METRIC              TARGET      LOCATION
+─────────────────────────────────────────────────────────────────────────────
+Validation IoU      ≥ 80%       Overview Tab
+Validation Dice     ≥ 80%       Overview Tab
+Training Loss       < 0.30      Training Curves Tab
+Learning Rate       Decreasing  Training Curves Tab
+
+TYPICAL PROGRESSION:
+    Epochs 1-10:    IoU/Dice 0.0-0.4   (Learning basics)
+    Epochs 10-30:   IoU/Dice 0.4-0.6   (Improving)
+    Epochs 30-50:   IoU/Dice 0.6-0.75  (Getting better)
+    Epochs 50+:     IoU/Dice 0.75-0.85 (TARGET ACHIEVED! 🎯)
+
+================================================================================
+                          OUTPUT FILES STRUCTURE
+================================================================================
+
+outputs/
+├── training_metrics.json          ← Real-time metrics (auto-updated)
+│
+├── validation_samples/            ← Samples for dashboard visualization
+│   ├── sample_0_input.npy         (8, H, W) - Input channels
+│   ├── sample_0_target.npy        (1, H, W) - Ground truth
+│   ├── sample_1_input.npy
+│   └── ...
+│
+└── checkpoints/                   ← Model checkpoints
+    ├── unet_best.pt               Best validation loss
+    ├── unet_final.pt              Final epoch
+    ├── unet_epoch_10.pt           Periodic saves
+    ├── unet_epoch_20.pt
+    └── ...
+
+================================================================================
+                        DASHBOARD CONTROLS
+================================================================================
+
+SIDEBAR:
+    [x] Auto-refresh (5s)          Enable automatic metric updates
+    [ ] Refresh Now                Manual refresh button
+    
+    Display Mode:
+    ( ) Overview                   Current status and metrics
+    ( ) Training Curves            Detailed plots
+    ( ) Predictions                Model visualization
+    ( ) Checkpoints                Browse saved models
+
+================================================================================
+                           TROUBLESHOOTING
+================================================================================
+
+PROBLEM: Dashboard shows "No training metrics found"
+SOLUTION: Make sure you're running train_with_dashboard.py, not other scripts
+          Check that outputs/training_metrics.json exists
+
+PROBLEM: Dashboard not updating
+SOLUTION: Enable "Auto-refresh (5s)" in sidebar
+          Or click "Refresh Now" manually
+          Verify training script is still running
+
+PROBLEM: No validation samples for visualization
+SOLUTION: Increase --save-samples parameter (e.g., --save-samples 10)
+          Check outputs/validation_samples/ directory exists
+
+PROBLEM: GPU out of memory
+SOLUTION: Reduce batch size: --batch-size 2 or --batch-size 1
+          Or reduce grid size: --grid-size 256
+          Close other GPU applications
+
+PROBLEM: Encoding errors on Windows
+SOLUTION: Should be automatic! Scripts configure UTF-8 automatically
+          If issues persist: set PYTHONIOENCODING=utf-8 in terminal
+
+================================================================================
+                        AFTER TRAINING COMPLETES
+================================================================================
+
+When IoU and Dice reach 80%+, validate on real fires:
+
+1. VALIDATE ON CAMP FIRE 2018:
+   python scripts/validate_camp_2018.py --checkpoint outputs/checkpoints/unet_best.pt
+
+2. COMPREHENSIVE EVALUATION:
+   python scripts/evaluate_model.py --checkpoint outputs/checkpoints/unet_best.pt
+
+3. TEST ON NEW REGIONS:
+   python scripts/fetch_real_data.py --west -122.5 --south 37.5 --east -122 --north 38
+   python scripts/visualize_predictions.py --checkpoint outputs/checkpoints/unet_best.pt
+
+4. INTERACTIVE AGENT:
+   streamlit run scripts/agent_app.py
+
+================================================================================
+                          PERFORMANCE TIPS
+================================================================================
+
+FOR FASTER TRAINING:
+    ✓ Use GPU (20-50x faster than CPU)
+    ✓ Increase batch size (if GPU memory allows)
+    ✓ Use smaller grid for testing (128x128)
+    ✓ Reduce samples for quick iterations (100-200)
+
+FOR BETTER ACCURACY:
+    ✓ Train longer (50-100+ epochs)
+    ✓ Use more samples (1000-2000+)
+    ✓ Keep 512x512 resolution
+    ✓ Monitor IoU/Dice convergence
+    ✓ Save periodic checkpoints
+
+FOR DEBUGGING:
+    ✓ Check training_metrics.json directly
+    ✓ Verify validation samples exist
+    ✓ Use Predictions tab to see what model learned
+    ✓ Compare checkpoints in Checkpoints tab
+
+================================================================================
+                        DOCUMENTATION REFERENCE
+================================================================================
+
+FILE                              PURPOSE
+─────────────────────────────────────────────────────────────────────────────
+scripts/README_DASHBOARD.md       Complete feature guide
+DASHBOARD_SETUP_COMPLETE.md       Implementation summary
+QUICK_START_DASHBOARD.md          One-minute quick start
+LIVE_DASHBOARD_STATUS.md          Full status and technical details
+scripts/DASHBOARD_USAGE_GUIDE.txt  This file
+
+================================================================================
+                           SYSTEM REQUIREMENTS
+================================================================================
+
+INSTALLED ✓
+    - Python 3.9+
+    - PyTorch 2.10.0
+    - Streamlit 1.54.0
+    - tqdm 4.67.3
+    - NumPy, Matplotlib, Pandas
+
+OPTIONAL (for faster training):
+    - GPU with ROCm or CUDA
+    - 8GB+ GPU memory (for 512x512 grids)
+
+PLATFORMS:
+    ✓ Windows (UTF-8 auto-configured)
+    ✓ Linux
+    ✓ macOS
+
+================================================================================
+                            WORKFLOW DIAGRAM
+================================================================================
+
+    ┌──────────────────┐         ┌──────────────────┐         ┌──────────────┐
+    │   Terminal 1     │         │   Terminal 2     │         │   Browser    │
+    │   (Training)     │         │   (Dashboard)    │         │              │
+    └──────────────────┘         └──────────────────┘         └──────────────┘
+            │                            │                            │
+            │ Start training             │                            │
+            │─────────────────→          │                            │
+            │                            │                            │
+            │ Generate data              │                            │
+            │ Initialize model           │                            │
+            │                            │ Start dashboard            │
+            │                            │─────────────────→          │
+            │                            │                            │
+            │ Epoch 1                    │                   Load metrics
+            │  └─ Save metrics ──────────→ Read JSON ───────→ Display
+            │                            │                            │
+            │ Epoch 2                    │                   Auto-refresh
+            │  └─ Save metrics ──────────→ Update ──────────→ Update
+            │                            │                            │
+            │ ...                        │                   View predictions
+            │                            │                   Export CSV
+            │ Epoch 50                   │                   Browse checkpoints
+            │  └─ Save best model        │                            │
+            │                            │                            │
+            │ Training complete!         │                   Final results
+            └────────────────────────────┴────────────────────────────┘
+
+================================================================================
+                         READY TO START TRAINING!
+================================================================================
+
+Step 1: Open two terminals in VS Code
+Step 2: Run training script in Terminal 1
+Step 3: Run dashboard in Terminal 2
+Step 4: Open browser to http://localhost:8501
+Step 5: Watch your model train in real-time! 🔥
+
+For questions or issues, check the documentation files listed above.
+
+Happy training! 🚀
+================================================================================

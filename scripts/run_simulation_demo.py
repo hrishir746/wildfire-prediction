@@ -1,0 +1,118 @@
+"""
+Demo: Run Rothermel-inspired fire spread simulation with synthetic terrain.
+
+No external data required. Creates demo terrain and runs fire spread.
+Run: python scripts/run_simulation_demo.py [--no-show]
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add project root to path
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from src.simulation import FireSpreadSimulator
+from src.simulation.rothermel_simulator import SimulationParams
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Rothermel simulation demo")
+    parser.add_argument("--no-show", action="store_true", help="Save PNG only, do not open plot window")
+    args = parser.parse_args()
+    print("Wildfire Spread Simulation Demo")
+    print("=" * 40)
+    print("Using Rothermel-inspired deterministic model (1972)")
+    print()
+
+    params = SimulationParams(
+        grid_rows=64,
+        grid_cols=64,
+        cell_size_m=30.0,
+        time_step_s=60.0,
+    )
+    sim = FireSpreadSimulator(params)
+
+    # Create synthetic terrain
+    print("Creating synthetic terrain...")
+    slope_deg, aspect_deg, fuel_density = sim.create_demo_terrain(
+        rows=64, cols=64, seed=42
+    )
+
+    # Center ignition
+    ignition_mask = np.zeros((64, 64), dtype=bool)
+    ignition_mask[30:34, 30:34] = True
+
+    # Run with wind from West (270 deg) at 5 m/s
+    wind_speed = 5.0
+    wind_direction = 270.0  # from West -> fire spreads East
+    print(f"Wind: {wind_speed} m/s from {wind_direction}deg")
+    print("Running simulation...")
+
+    history = sim.run(
+        ignition_mask=ignition_mask,
+        slope_deg=slope_deg,
+        aspect_deg=aspect_deg,
+        wind_speed=wind_speed,
+        wind_direction_deg=wind_direction,
+        fuel_density=fuel_density,
+        max_steps=50,
+    )
+
+    print(f"Completed {len(history)} steps")
+    burned = np.sum(history[-1] > 0)
+    print(f"Total burned cells: {burned}")
+
+    # Visualize
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    # Initial state
+    ax = axes[0]
+    fire_0 = history[0].copy()
+    img = np.zeros((*fire_0.shape, 4))
+    img[fire_0 == 1, :] = [1, 0.3, 0, 1]  # orange = burning
+    ax.imshow(img)
+    ax.set_title("t=0 (Ignition)")
+    ax.axis("off")
+
+    # Mid state
+    mid = len(history) // 2
+    ax = axes[1]
+    fire_mid = history[mid]
+    img = np.zeros((*fire_mid.shape, 4))
+    img[fire_mid == 1, :] = [1, 0.3, 0, 1]
+    img[fire_mid == 2, :] = [0.8, 0.2, 0, 1]  # red = burned
+    ax.imshow(img)
+    ax.set_title(f"t={mid}")
+    ax.axis("off")
+
+    # Final state
+    ax = axes[2]
+    fire_final = history[-1]
+    img = np.zeros((*fire_final.shape, 4))
+    img[fire_final == 1, :] = [1, 0.3, 0, 1]
+    img[fire_final == 2, :] = [0.8, 0.2, 0, 1]
+    ax.imshow(img)
+    ax.set_title(f"t={len(history)-1} (Final)")
+    ax.axis("off")
+
+    plt.suptitle("Rothermel-Inspired Fire Spread (Synthetic Terrain)")
+    plt.tight_layout()
+
+    out_dir = ROOT / "outputs"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / "simulation_demo.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\nSaved visualization to {out_path}")
+    if not args.no_show:
+        plt.show()
+    else:
+        plt.close()
+
+
+if __name__ == "__main__":
+    main()

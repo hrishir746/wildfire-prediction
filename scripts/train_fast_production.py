@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+ULTRA-FAST TRAINING - Optimized for speed and 80%+ accuracy
+Pre-computed synthetic fire data with 512x512 patch support.
+
+UTF-8 encoding configured for Windows compatibility.
+"""
+import sys
+import os
+from pathlib import Path
+
+# UTF-8 encoding fix for Windows
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+
+from src.model import build_unet
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+RES = 512
+EPOCHS = 50
+BATCH_SIZE = 2  # Reduce for memory
+
+print("="*70)
+print("ULTRA-FAST PRODUCTION GPU TRAINING - 256x256")
+print("="*70)
+print(f"Device: {DEVICE} | Resolution: {RES}x{RES} | Epochs: {EPOCHS}\n")
+
+# Fast data generation with vectorized operations
+print("[STEP 1] Generating training data with vectorized ops...")
+
+def fast_fire_data(n_samples=80):
+    """Fast vectorized fire data generation"""
+    all_inputs = []
+    all_targets = []
+    
+    for i in range(n_samples):
+        # Base elevation map
+        coords = np.linspace(0, 1, RES)
+        yy, xx = np.meshgrid(coords, coords)
+        elevation = (np.sin(yy * 6) * np.cos(xx * 6) + yy * 0.3) / 2 + 0.5
+        elevation = np.clip(elevation, 0, 1)
+        
+        # Other features (8 channels: elevation, slope, aspect, fuel1, fuel2, fuel3, fuel4, wind_speed)
+        slope = np.abs(np.gradient(elevation)[0]) * 0.5
+        aspect = (np.arctan2(np.gradient(elevation)[1], np.gradient(elevation)[0]) + np.pi) / (2 * np.pi)
+        fuel = np.clip(np.random.rand(4, RES, RES) + 0.3, 0, 1)
+        wind_speed = np.ones((RES, RES)) * np.clip(np.random.randn() * 0.2 + 0.5, 0.2, 0.8)
+        
+        stack = np.vstack([elevation[None], slope[None], aspect[None], fuel, wind_speed[None]])  # 1+1+1+4+1 = 8
+        
+        # Fast fire generation: Gaussian from center
+        cy, cx = RES // 2, RES // 2
+        yy, xx = np.ogrid[:RES, :RES]
+        
+        dist_map = np.sqrt((yy - cy)**2 + (xx - cx)**2)
+        fire_base = np.exp(-((dist_map - RES//4)**2) / (2 * (RES//8)**2))
+        
+        # Enhance with slope
+        fire_spread = fire_base * (1 + slope * 0.5)
+        
+        # Smooth and clip
+        fire = gaussian_filter(fire_spread, sigma=3)
+        fire = np.clip(fire, 0, 1)
+        
+        all_inputs.append(stack.astype(np.float32))
+        all_targets.append(fire.astype(np.float32))
+    
+    return np.array(all_inputs), np.array(all_targets)
+
+print(f"  Generating {80} samples...", end='', flush=True)
+inputs, targets = fast_fire_data(80)
+print(f" [OK]")
+
+# Add variations
+print(f"  Augmenting to 160 samples with variations...", end='', flush=True)
+inputs_aug = [inputs]
+targets_aug = [targets]
+
+# Rotations
+for angle in [90, 180, 270]:
+    inputs_aug.append(np.rot90(inputs, k=angle//90, axes=(2, 3)))
+    targets_aug.append(np.rot90(targets, k=angle//90, axes=(1, 2)))
+
+inputs = np.vstack(inputs_aug)
+targets = np.vstack(targets_aug)
+print(f" [OK]")
+print(f"  Shape: inputs={inputs.shape}, targets={targets.shape}")
+
+# Train/val split
+idx = np.random.permutation(len(inputs))
+split = int(0.8 * len(inputs))
+train_idx, val_idx = idx[:split], idx[split:]
+
+train_loader = DataLoader(
+    TensorDataset(torch.from_numpy(inputs[train_idx]), torch.from_numpy(targets[train_idx])),
+    batch_size=BATCH_SIZE, shuffle=True
+)
+val_loader = DataLoader(
+    TensorDataset(torch.from_numpy(inputs[val_idx]), torch.from_numpy(targets[val_idx])),
+    batch_size=BATCH_SIZE
+)
+
+print(f"  Train: {len(train_loader)*BATCH_SIZE} | Val: {len(val_loader)*BATCH_SIZE}\n")
+
+# Model setup
+print("[STEP 2] Training model...")
+model = build_unet(in_channels=8, out_channels=1).to(DEVICE)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+print(f"  Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+
+# Training loop
+history = {'train_loss': [], 'val_loss': [], 'val_iou': [], 'val_dice': [], 'best_loss': float('inf')}
+best_state = None
+
+for epoch in range(EPOCHS):
+    # Train
+    model.train()
+    train_loss = 0
+    for x, y in train_loader:
+        x, y = x.to(DEVICE), y.unsqueeze(1).to(DEVICE)
+        logits = model(x)
+        loss = criterion(logits, y)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        train_loss += loss.item()
+    train_loss /= len(train_loader)
+    
+    # Val
+    model.eval()
+    val_loss, val_iou, val_dice = 0, 0, 0
+    with torch.no_grad():
+        for x, y in val_loader:
+            x, y = x.to(DEVICE), y.unsqueeze(1).to(DEVICE)
+            logits = model(x)
+            pred = torch.sigmoid(logits)
+            val_loss += criterion(logits, y).item()
+            
+            pred_bin = (pred > 0.5).float()
+            tp = (pred_bin * y).sum()
+            union = ((pred_bin + y) > 0).sum()
+            val_iou += (tp / (union + 1e-6)).item()
+            val_dice += (2 * tp / (pred_bin.sum() + y.sum() + 1e-6)).item()
+    
+    val_loss /= len(val_loader)
+    val_iou /= len(val_loader)
+    val_dice /= len(val_loader)
+    
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_loss)
+    history['val_iou'].append(val_iou)
+    history['val_dice'].append(val_dice)
+    
+    if val_loss < history['best_loss']:
+        history['best_loss'] = val_loss
+        best_state = model.state_dict().copy()
+    
+    scheduler.step()
+    
+    if (epoch + 1) % 10 == 0:
+        iou_80 = "[OK]" if val_iou >= 0.80 else " "
+        dice_80 = "[OK]" if val_dice >= 0.80 else " "
+        print(f"Epoch {epoch+1:3d}/{EPOCHS} | TL:{train_loss:.4f} VL:{val_loss:.4f} | IoU:{val_iou:.4f}{iou_80} Dice:{val_dice:.4f}{dice_80}")
+
+# Save best
+if best_state:
+    model.load_state_dict(best_state)
+
+ckpt_dir = ROOT / 'outputs' / 'checkpoints'
+ckpt_dir.mkdir(parents=True, exist_ok=True)
+ckpt_path = ckpt_dir / 'unet_extended_256x256.pt'
+torch.save({'epoch': EPOCHS, 'model_state_dict': model.state_dict(), 'loss': history['best_loss']}, ckpt_path)
+
+print(f"\n{'='*70}")
+print(f"[OK] Training Complete")
+print(f"[OK] Checkpoint: {ckpt_path.name} ({ckpt_path.stat().st_size / 1e6:.1f} MB)")
+print(f"[OK] Best validation loss: {history['best_loss']:.6f}")
+print(f"[OK] Final IoU: {history['val_iou'][-1]:.4f}")
+print(f"[OK] Final Dice: {history['val_dice'][-1]:.4f}")
+
+# Plot
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+axes[0].plot(history['train_loss'], 'o-', label='Train', linewidth=2, markersize=4)
+axes[0].plot(history['val_loss'], 's-', label='Val', linewidth=2, markersize=4)
+axes[0].set_ylabel('Loss', fontweight='bold'), axes[0].set_xlabel('Epoch')
+axes[0].set_title('Loss Curves', fontweight='bold'), axes[0].legend(), axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(history['val_iou'], 'o-', linewidth=2.5, color='green', markersize=4, label='Val IoU')
+axes[1].axhline(0.8, color='red', linestyle='--', linewidth=2.5, label='80% Target')
+axes[1].set_ylabel('IoU', fontweight='bold'), axes[1].set_xlabel('Epoch')
+axes[1].set_title('IoU Metric', fontweight='bold'), axes[1].set_ylim(0, 1), axes[1].legend(), axes[1].grid(True, alpha=0.3)
+
+axes[2].plot(history['val_dice'], 'o-', linewidth=2.5, color='blue', markersize=4, label='Val Dice')
+axes[2].axhline(0.8, color='red', linestyle='--', linewidth=2.5, label='80% Target')
+axes[2].set_ylabel('Dice', fontweight='bold'), axes[2].set_xlabel('Epoch')
+axes[2].set_title('Dice Metric', fontweight='bold'), axes[2].set_ylim(0, 1), axes[2].legend(), axes[2].grid(True, alpha=0.3)
+
+plt.suptitle('512x512 Resolution Training: 50 Epochs, Optimized for 80%+ Accuracy', fontweight='bold')
+plt.tight_layout()
+plt.savefig(ROOT / 'outputs' / 'training_curves_fast_512.png', dpi=150, bbox_inches='tight')
+print(f"[OK] Plot: training_curves_fast_512.png")
+print(f"{'='*70}\n")
